@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,6 +87,77 @@ func TestDispatchIncoming_UsesActualChatIDAndStoresReqIDRoute(t *testing.T) {
 	}
 }
 
+func TestNewChannel_DoesNotRegisterMessageSplitLimit(t *testing.T) {
+	t.Parallel()
+
+	ch := newTestWeComChannel(t, bus.NewMessageBus())
+	if got := ch.MaxMessageLength(); got != 0 {
+		t.Fatalf("MaxMessageLength() = %d, want 0", got)
+	}
+}
+
+func TestBeginStream_UpdateAndFinalize(t *testing.T) {
+	t.Parallel()
+
+	ch := newTestWeComChannel(t, bus.NewMessageBus())
+	ch.SetRunning(true)
+	ch.queueTurn("chat-1", wecomTurn{
+		ReqID:     "req-1",
+		ChatID:    "chat-1",
+		ChatType:  1,
+		StreamID:  "stream-1",
+		CreatedAt: time.Now(),
+	})
+
+	var commands []wecomCommand
+	ch.commandSend = func(cmd wecomCommand, _ time.Duration) (wecomEnvelope, error) {
+		commands = append(commands, cmd)
+		return wecomTestAck(nil), nil
+	}
+
+	streamer, err := ch.BeginStream(context.Background(), "chat-1")
+	if err != nil {
+		t.Fatalf("BeginStream() error = %v", err)
+	}
+	if err := streamer.Update(context.Background(), "draft"); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if err := streamer.Finalize(context.Background(), "final"); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+
+	if len(commands) != 2 {
+		t.Fatalf("expected 2 commands, got %d", len(commands))
+	}
+	for i, wantFinish := range []bool{false, true} {
+		if commands[i].Cmd != wecomCmdRespondMsg {
+			t.Fatalf("command[%d].Cmd = %q, want %q", i, commands[i].Cmd, wecomCmdRespondMsg)
+		}
+		body, ok := commands[i].Body.(wecomRespondMsgBody)
+		if !ok {
+			t.Fatalf("command[%d] body type = %T", i, commands[i].Body)
+		}
+		if body.Stream == nil {
+			t.Fatalf("command[%d] missing stream body", i)
+		}
+		if body.Stream.ID != "stream-1" {
+			t.Fatalf("command[%d] stream id = %q, want stream-1", i, body.Stream.ID)
+		}
+		if body.Stream.Finish != wantFinish {
+			t.Fatalf("command[%d] finish = %v, want %v", i, body.Stream.Finish, wantFinish)
+		}
+	}
+	if body := commands[0].Body.(wecomRespondMsgBody); body.Stream.Content != "draft" {
+		t.Fatalf("update content = %q, want draft", body.Stream.Content)
+	}
+	if body := commands[1].Body.(wecomRespondMsgBody); body.Stream.Content != "final" {
+		t.Fatalf("final content = %q, want final", body.Stream.Content)
+	}
+	if _, ok := ch.getTurn("chat-1"); ok {
+		t.Fatal("expected turn to be consumed after Finalize")
+	}
+}
+
 func TestSend_StreamFailureFallsBackToActualChatID(t *testing.T) {
 	t.Parallel()
 
@@ -152,6 +224,85 @@ func TestSend_StreamFailureFallsBackToActualChatID(t *testing.T) {
 	}
 	if nextTurn.ReqID != "req-2" {
 		t.Fatalf("next queued req_id = %q, want req-2", nextTurn.ReqID)
+	}
+}
+
+func TestSend_DoesNotSplitStreamReply(t *testing.T) {
+	t.Parallel()
+
+	ch := newTestWeComChannel(t, bus.NewMessageBus())
+	ch.SetRunning(true)
+	ch.queueTurn("chat-1", wecomTurn{
+		ReqID:     "req-1",
+		ChatID:    "chat-1",
+		ChatType:  1,
+		StreamID:  "stream-1",
+		CreatedAt: time.Now(),
+	})
+
+	var commands []wecomCommand
+	ch.commandSend = func(cmd wecomCommand, _ time.Duration) (wecomEnvelope, error) {
+		commands = append(commands, cmd)
+		return wecomTestAck(nil), nil
+	}
+
+	content := strings.Repeat("\u4e2d", 30000)
+	if err := ch.Send(context.Background(), bus.OutboundMessage{
+		Channel: "wecom",
+		ChatID:  "chat-1",
+		Content: content,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 stream command, got %d", len(commands))
+	}
+	body, ok := commands[0].Body.(wecomRespondMsgBody)
+	if !ok {
+		t.Fatalf("unexpected body type %T", commands[0].Body)
+	}
+	if body.Stream == nil || !body.Stream.Finish {
+		t.Fatalf("stream body = %+v", body.Stream)
+	}
+	if body.Stream.Content != content {
+		t.Fatalf("stream content length = %d, want %d", len(body.Stream.Content), len(content))
+	}
+}
+
+func TestSend_DoesNotSplitActivePush(t *testing.T) {
+	t.Parallel()
+
+	ch := newTestWeComChannel(t, bus.NewMessageBus())
+	ch.SetRunning(true)
+
+	var commands []wecomCommand
+	ch.commandSend = func(cmd wecomCommand, _ time.Duration) (wecomEnvelope, error) {
+		commands = append(commands, cmd)
+		return wecomTestAck(nil), nil
+	}
+
+	content := strings.Repeat("a", 30000)
+	if err := ch.Send(context.Background(), bus.OutboundMessage{
+		Channel: "wecom",
+		ChatID:  "chat-1",
+		Content: content,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 send command, got %d", len(commands))
+	}
+	if commands[0].Cmd != wecomCmdSendMsg {
+		t.Fatalf("command = %q, want %q", commands[0].Cmd, wecomCmdSendMsg)
+	}
+	body, ok := commands[0].Body.(wecomSendMsgBody)
+	if !ok {
+		t.Fatalf("unexpected body type %T", commands[0].Body)
+	}
+	if body.Markdown == nil || body.Markdown.Content != content {
+		t.Fatalf("markdown content length = %d, want %d", len(body.Markdown.Content), len(content))
 	}
 }
 

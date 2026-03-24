@@ -26,6 +26,7 @@ const (
 	wecomUploadTimeout     = 30 * time.Second
 	wecomHeartbeatInterval = 30 * time.Second
 	wecomStreamMaxDuration = 5*time.Minute + 30*time.Second
+	wecomStreamMinInterval = 500 * time.Millisecond
 	wecomRouteTTL          = 30 * time.Minute
 	wecomMediaTimeout      = 30 * time.Second
 	wecomRecentMessageMax  = 1000
@@ -59,6 +60,17 @@ type wecomTurn struct {
 	ChatType  uint32
 	StreamID  string
 	CreatedAt time.Time
+}
+
+type wecomStreamer struct {
+	channel *WeComChannel
+	chatID  string
+	turn    wecomTurn
+
+	mu         sync.Mutex
+	closed     bool
+	lastSentAt time.Time
+	content    string
 }
 
 type recentMessageSet struct {
@@ -109,7 +121,6 @@ func NewChannel(cfg config.WeComConfig, messageBus *bus.MessageBus) (*WeComChann
 		cfg,
 		messageBus,
 		cfg.AllowFrom,
-		channels.WithMaxMessageLength(wecomMaxContentBytes),
 		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
 	)
 
@@ -152,6 +163,27 @@ func (c *WeComChannel) Stop(_ context.Context) error {
 	return nil
 }
 
+func (c *WeComChannel) BeginStream(_ context.Context, chatID string) (channels.Streamer, error) {
+	if !c.IsRunning() {
+		return nil, channels.ErrNotRunning
+	}
+
+	turn, ok := c.getTurn(chatID)
+	if !ok {
+		return nil, fmt.Errorf("wecom streaming unavailable: no active turn")
+	}
+	if time.Since(turn.CreatedAt) > wecomStreamMaxDuration {
+		c.consumeTurn(chatID, turn)
+		return nil, fmt.Errorf("wecom streaming unavailable: turn expired")
+	}
+
+	return &wecomStreamer{
+		channel: c,
+		chatID:  chatID,
+		turn:    turn,
+	}, nil
+}
+
 func (c *WeComChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	if !c.IsRunning() {
 		return channels.ErrNotRunning
@@ -164,11 +196,11 @@ func (c *WeComChannel) Send(ctx context.Context, msg bus.OutboundMessage) error 
 	if turn, ok := c.getTurn(msg.ChatID); ok {
 		if time.Since(turn.CreatedAt) <= wecomStreamMaxDuration {
 			if err := c.sendStreamReply(turn, content); err == nil {
-				c.deleteTurn(msg.ChatID)
+				c.consumeTurn(msg.ChatID, turn)
 				return nil
 			}
 		}
-		c.deleteTurn(msg.ChatID)
+		c.consumeTurn(msg.ChatID, turn)
 	}
 
 	if route, ok := c.routes.Get(msg.ChatID); ok {
@@ -649,13 +681,7 @@ func (c *WeComChannel) respondImmediate(reqID, content string) error {
 }
 
 func (c *WeComChannel) sendStreamReply(turn wecomTurn, content string) error {
-	chunks := splitContent(content, wecomMaxContentBytes)
-	for idx, chunk := range chunks {
-		if err := c.sendStreamChunk(turn, idx == len(chunks)-1, chunk); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.sendStreamChunk(turn, true, content)
 }
 
 func (c *WeComChannel) sendStreamChunk(turn wecomTurn, finish bool, content string) error {
@@ -691,21 +717,16 @@ func (c *WeComChannel) sendActivePush(chatID string, chatType uint32, content st
 	if strings.TrimSpace(chatID) == "" {
 		return fmt.Errorf("empty chat ID: %w", channels.ErrSendFailed)
 	}
-	for _, chunk := range splitContent(content, wecomMaxContentBytes) {
-		if err := c.sendCommand(wecomCommand{
-			Cmd:     wecomCmdSendMsg,
-			Headers: wecomHeaders{ReqID: randomID(10)},
-			Body: wecomSendMsgBody{
-				ChatID:   chatID,
-				ChatType: chatType,
-				MsgType:  "markdown",
-				Markdown: &wecomMarkdownContent{Content: chunk},
-			},
-		}, wecomCommandTimeout); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.sendCommand(wecomCommand{
+		Cmd:     wecomCmdSendMsg,
+		Headers: wecomHeaders{ReqID: randomID(10)},
+		Body: wecomSendMsgBody{
+			ChatID:   chatID,
+			ChatType: chatType,
+			MsgType:  "markdown",
+			Markdown: &wecomMarkdownContent{Content: content},
+		},
+	}, wecomCommandTimeout)
 }
 
 func (c *WeComChannel) sendActiveMedia(chatID string, chatType uint32, uploaded *wecomOutboundMedia) error {
@@ -825,6 +846,26 @@ func (c *WeComChannel) queueTurn(chatID string, turn wecomTurn) {
 	c.turns[chatID] = append(c.turns[chatID], turn)
 }
 
+func (c *WeComChannel) consumeTurn(chatID string, turn wecomTurn) bool {
+	c.turnsMu.Lock()
+	defer c.turnsMu.Unlock()
+
+	queue := c.turns[chatID]
+	if len(queue) == 0 {
+		return false
+	}
+	current := queue[0]
+	if current.ReqID != turn.ReqID || current.StreamID != turn.StreamID {
+		return false
+	}
+	if len(queue) == 1 {
+		delete(c.turns, chatID)
+		return true
+	}
+	c.turns[chatID] = queue[1:]
+	return true
+}
+
 func (c *WeComChannel) clearTurns() {
 	c.turnsMu.Lock()
 	c.turns = make(map[string][]wecomTurn)
@@ -844,34 +885,86 @@ func randomID(n int) string {
 	return string(buf)
 }
 
-func splitContent(content string, maxBytes int) []string {
-	if content == "" {
-		return []string{""}
+func (s *wecomStreamer) Update(ctx context.Context, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
 	}
-	if len(content) <= maxBytes {
-		return []string{content}
+	if err := s.validateActiveTurn(); err != nil {
+		return err
 	}
-	chunks := channels.SplitMessage(content, maxBytes)
-	var result []string
-	for _, chunk := range chunks {
-		if len(chunk) <= maxBytes {
-			result = append(result, chunk)
-			continue
-		}
-		for len(chunk) > maxBytes {
-			end := maxBytes
-			for end > 0 && chunk[end]>>6 == 0b10 {
-				end--
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if !s.lastSentAt.IsZero() {
+		wait := time.Until(s.lastSentAt.Add(wecomStreamMinInterval))
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
 			}
-			if end == 0 {
-				end = maxBytes
-			}
-			result = append(result, chunk[:end])
-			chunk = strings.TrimLeft(chunk[end:], " \t\r\n")
-		}
-		if chunk != "" {
-			result = append(result, chunk)
 		}
 	}
-	return result
+
+	if err := s.channel.sendStreamChunk(s.turn, false, content); err != nil {
+		return err
+	}
+	s.content = content
+	s.lastSentAt = time.Now()
+	return nil
+}
+
+func (s *wecomStreamer) Finalize(ctx context.Context, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+	if err := s.validateActiveTurn(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.channel.sendStreamChunk(s.turn, true, content); err != nil {
+		return err
+	}
+
+	s.content = content
+	s.closed = true
+	s.channel.consumeTurn(s.chatID, s.turn)
+	return nil
+}
+
+func (s *wecomStreamer) Cancel(_ context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	if s.validateActiveTurn() == nil {
+		_ = s.channel.sendStreamChunk(s.turn, true, s.content)
+		s.channel.consumeTurn(s.chatID, s.turn)
+	}
+	s.closed = true
+}
+
+func (s *wecomStreamer) validateActiveTurn() error {
+	if time.Since(s.turn.CreatedAt) > wecomStreamMaxDuration {
+		s.channel.consumeTurn(s.chatID, s.turn)
+		return fmt.Errorf("wecom streaming unavailable: turn expired")
+	}
+	current, ok := s.channel.getTurn(s.chatID)
+	if !ok || current.ReqID != s.turn.ReqID || current.StreamID != s.turn.StreamID {
+		return fmt.Errorf("wecom streaming unavailable: turn no longer active")
+	}
+	return nil
 }

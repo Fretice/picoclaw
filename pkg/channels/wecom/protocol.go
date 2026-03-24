@@ -13,7 +13,6 @@ const (
 	wecomCmdUploadMediaInit  = "aibot_upload_media_init"
 	wecomCmdUploadMediaChunk = "aibot_upload_media_chunk"
 	wecomCmdUploadMediaEnd   = "aibot_upload_media_finish"
-	wecomMaxContentBytes     = 20480
 )
 
 type wecomEnvelope struct {
