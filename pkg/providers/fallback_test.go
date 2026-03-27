@@ -152,6 +152,39 @@ func TestFallback_NonRetriableError(t *testing.T) {
 	}
 }
 
+func TestFallback_HTTP400IsRetriableForFallback(t *testing.T) {
+	ct := NewCooldownTracker()
+	fc := NewFallbackChain(ct)
+
+	candidates := []FallbackCandidate{
+		makeCandidate("openai", "gpt-4"),
+		makeCandidate("anthropic", "claude"),
+	}
+
+	attempt := 0
+	run := func(ctx context.Context, provider, model string) (*LLMResponse, error) {
+		attempt++
+		if attempt == 1 {
+			return nil, errors.New("API request failed: status: 400")
+		}
+		return &LLMResponse{Content: "fallback success", FinishReason: "stop"}, nil
+	}
+
+	result, err := fc.Execute(context.Background(), candidates, run)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil || result.Response == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Response.Content != "fallback success" {
+		t.Fatalf("content = %q, want fallback success", result.Response.Content)
+	}
+	if attempt != 2 {
+		t.Fatalf("attempt = %d, want 2", attempt)
+	}
+}
+
 func TestFallback_CooldownSkip(t *testing.T) {
 	now := time.Now()
 	ct, _ := newTestTracker(now)

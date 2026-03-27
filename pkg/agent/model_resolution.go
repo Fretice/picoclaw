@@ -54,14 +54,49 @@ func resolveModelCandidates(
 	primary string,
 	fallbacks []string,
 ) []providers.FallbackCandidate {
+	resolvedFallbacks := resolveFallbackModelNames(cfg, fallbacks)
+
 	return providers.ResolveCandidatesWithLookup(
 		providers.ModelConfig{
 			Primary:   primary,
-			Fallbacks: fallbacks,
+			Fallbacks: resolvedFallbacks,
 		},
 		defaultProvider,
 		buildModelListResolver(cfg),
 	)
+}
+
+// resolveFallbackModelNames resolves fallback model names for candidate building.
+//
+// Behavior:
+// - If fallbacks is explicitly configured (including empty []), preserve it as-is.
+// - If fallbacks is nil (unset), auto-append all non-virtual model_name entries
+//   from model_list so HTTP failures can cascade through remaining configured models.
+func resolveFallbackModelNames(cfg *config.Config, fallbacks []string) []string {
+	if fallbacks != nil {
+		return fallbacks
+	}
+	if cfg == nil || len(cfg.ModelList) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(cfg.ModelList))
+	auto := make([]string, 0, len(cfg.ModelList))
+	for _, m := range cfg.ModelList {
+		if m == nil || m.IsVirtual() {
+			continue
+		}
+		name := strings.TrimSpace(m.ModelName)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		auto = append(auto, name)
+	}
+	return auto
 }
 
 func resolvedCandidateModel(candidates []providers.FallbackCandidate, fallback string) string {

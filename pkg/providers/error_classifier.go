@@ -146,14 +146,18 @@ func ClassifyError(err error, provider, model string) *FailoverError {
 
 	// Try HTTP status code extraction first.
 	if status := extractHTTPStatus(msg); status > 0 {
-		if reason := classifyByStatus(status); reason != "" {
-			return &FailoverError{
-				Reason:   reason,
-				Provider: provider,
-				Model:    model,
-				Status:   status,
-				Wrapped:  err,
-			}
+		reason := classifyByStatus(status)
+		if reason == "" {
+			// Any non-200 HTTP status from provider API is considered a provider failure.
+			// Keep it retriable as unknown so fallback can continue to the next model.
+			reason = FailoverUnknown
+		}
+		return &FailoverError{
+			Reason:   reason,
+			Provider: provider,
+			Model:    model,
+			Status:   status,
+			Wrapped:  err,
 		}
 	}
 
@@ -181,8 +185,6 @@ func classifyByStatus(status int) FailoverReason {
 		return FailoverTimeout
 	case status == 429:
 		return FailoverRateLimit
-	case status == 400:
-		return FailoverFormat
 	case transientStatusCodes[status]:
 		return FailoverTimeout
 	}
