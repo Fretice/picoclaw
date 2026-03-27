@@ -1,0 +1,94 @@
+name: Build DEB (linux x86_64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (e.g. 0.2.0). Leave empty to auto-detect."
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve package version
+        id: meta
+        shell: bash
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+${GITHUB_SHA::8}"
+          fi
+
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build linux/amd64 binary (via Makefile)
+        shell: bash
+        run: |
+          mkdir -p dist
+          make build VERSION="${{ steps.meta.outputs.version_tag }}"
+          cp build/picoclaw-linux-amd64 dist/picoclaw
+
+      - name: Install nfpm
+        uses: goreleaser/nfpm-action@v1
+        with:
+          version: latest
+
+      - name: Generate nfpm config
+        shell: bash
+        run: |
+          cat > nfpm.yaml << 'EOF'
+          name: picoclaw
+          arch: amd64
+          platform: linux
+          version: "${{ steps.meta.outputs.version }}"
+          section: default
+          priority: optional
+          maintainer: picoclaw contributors
+          description: picoclaw - a tool for managing and running tasks
+          vendor: picoclaw
+          homepage: https://github.com/${{ github.repository }}
+          license: MIT
+          contents:
+            - src: ./dist/picoclaw
+              dst: /usr/bin/picoclaw
+              file_info:
+                mode: 0755
+          EOF
+
+      - name: Build .deb package
+        shell: bash
+        run: |
+          nfpm package \
+            --packager deb \
+            --config ./nfpm.yaml \
+            --target "dist/picoclaw_${{ steps.meta.outputs.version }}_amd64.deb"
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picoclaw-deb-linux-x86_64
+          path: dist/*.deb
+          if-no-files-found: error
